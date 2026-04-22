@@ -20,7 +20,7 @@ Dependencies:
   pip install reportlab --break-system-packages
 """
 
-import re, os, sys, json, argparse
+import re, os, sys, json, argparse, subprocess, tempfile, shutil
 from datetime import date
 from reportlab.lib.pagesizes import A4, LETTER
 from reportlab.lib.units import mm
@@ -29,7 +29,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 from reportlab.platypus import (
     BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer, PageBreak,
-    Table, TableStyle, NextPageTemplate, Flowable
+    Table, TableStyle, NextPageTemplate, Flowable, Image as RLImage
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -559,6 +559,7 @@ class PDFBuilder:
         self.body_w = self.page_w - self.lm - self.rm
         self.body_h = self.page_h - self.tm - self.bm
         self.accent_hex = config.get("accent_hex", "#CC785C")
+        self._mermaid_tmp_dirs = []
         self.ST = self._build_styles()
 
     def _build_styles(self):
@@ -1030,11 +1031,35 @@ class PDFBuilder:
                 out.append(line)
         return '\n'.join(out)
 
+    def _render_mermaid(self, code):
+        """Render mermaid code to a temp PNG via mmdc, return the file path or None."""
+        if not shutil.which("mmdc"):
+            return None
+        tmp_dir = tempfile.mkdtemp(prefix="md2pdf_mermaid_")
+        mmd_path = os.path.join(tmp_dir, "diagram.mmd")
+        png_path = os.path.join(tmp_dir, "diagram.png")
+        with open(mmd_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        try:
+            subprocess.run(
+                ["mmdc", "-i", mmd_path, "-o", png_path, "-b", "transparent", "-w", "1600", "-s", "2"],
+                capture_output=True, timeout=30
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+        if os.path.exists(png_path):
+            self._mermaid_tmp_dirs.append(tmp_dir)
+            return png_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
     def parse_md(self, md):
         story, toc = [], []
         md = self._preprocess_md(md)
         lines = md.split('\n')
         i, in_code, code_buf = 0, False, []
+        code_lang = ""
         ST = self.ST; ah = self.accent_hex
         code_max = self.cfg.get("code_max_lines", 30)
 
@@ -1044,7 +1069,25 @@ class PDFBuilder:
             if stripped.startswith('```'):
                 if in_code:
                     ct = '\n'.join(code_buf)
-                    if ct.strip():
+                    if code_lang == "mermaid" and ct.strip():
+                        png_path = self._render_mermaid(ct)
+                        if png_path:
+                            from reportlab.lib.utils import ImageReader
+                            img_reader = ImageReader(png_path)
+                            iw, ih = img_reader.getSize()
+                            max_w = self.body_w
+                            max_h = self.body_h * 0.6
+                            scale = min(max_w / iw, max_h / ih, 1.0)
+                            story.append(Spacer(1, 4*mm))
+                            story.append(RLImage(png_path, width=iw*scale, height=ih*scale))
+                            story.append(Spacer(1, 4*mm))
+                        else:
+                            para = Paragraph(_font_wrap(esc_code(ct)), ST['code'])
+                            if self._code_style_type == "border":
+                                story.append(LeftBorderParagraph(para, self.T["accent"]))
+                            else:
+                                story.append(para)
+                    elif ct.strip():
                         cl = ct.split('\n')
                         if len(cl) > code_max:
                             cl = cl[:code_max - 2] + ['  // ... (truncated)']
@@ -1054,8 +1097,10 @@ class PDFBuilder:
                             story.append(LeftBorderParagraph(para, self.T["accent"]))
                         else:
                             story.append(para)
-                    code_buf = []; in_code = False
-                else: in_code = True; code_buf = []
+                    code_buf = []; in_code = False; code_lang = ""
+                else:
+                    in_code = True; code_buf = []
+                    code_lang = stripped[3:].strip().lower()
                 i += 1; continue
             if in_code: code_buf.append(line); i += 1; continue
             if stripped in ('---','\\newpage','') or stripped.startswith(('title:','subtitle:','author:','date:')) \
@@ -1274,6 +1319,9 @@ class PDFBuilder:
         doc.addPageTemplates(templates)
         print("Building PDF...")
         doc.build(story)
+        for d in self._mermaid_tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        self._mermaid_tmp_dirs.clear()
         size = os.path.getsize(output_path)
         print(f"Done! {output_path} ({size/1024/1024:.1f} MB)")
 
